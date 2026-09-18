@@ -89,6 +89,16 @@ jobs:
         working-directory: ${{ steps.app.outputs.dir }}
         shell: bash
         run: |
+          # vinext emits multiple static routes under dist/client.
+          # Deploy the whole client tree instead of only the Open Studio subfolder.
+          if [ -f "dist/client/projects/open-studio/index.html" ]; then
+            REAL=$(realpath "dist/client")
+            echo "dir=$REAL" >> "$GITHUB_OUTPUT"
+            echo "Using full vinext client output: $REAL"
+            du -sh "$REAL"
+            exit 0
+          fi
+
           for dir in dist out build .output/public public; do
             if [ -f "$dir/index.html" ]; then
               REAL=$(realpath "$dir")
@@ -110,6 +120,69 @@ jobs:
           echo "Build completed but no static index.html output was found."
           find . -maxdepth 4 -type f | head -n 200
           exit 1
+
+      - name: Normalize GitHub Pages base paths
+        env:
+          OUTPUT_DIR: ${{ steps.output.outputs.dir }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          root=Path(os.environ["OUTPUT_DIR"])
+          repo=os.environ["REPO_NAME"]
+          base=f"/{repo}"
+
+          # The source project was authored for a domain root such as
+          # /projects/open-studio/... . GitHub project Pages lives under
+          # /<repo>/..., so absolute asset/routes must be rebased.
+          prefixes=[
+              "/projects/open-studio/",
+              "/photography/",
+              "/night-windows/",
+              "/guestbook",
+              "/openstudio-life",
+          ]
+
+          text_ext={".html",".css",".js",".mjs",".json",".map"}
+          changed=0
+          for path in root.rglob("*"):
+              if not path.is_file() or path.suffix.lower() not in text_ext:
+                  continue
+              try:
+                  text=path.read_text(encoding="utf-8")
+              except Exception:
+                  continue
+              new=text
+              for prefix in prefixes:
+                  new=new.replace(prefix, base+prefix)
+              # Root navigation links should stay inside this Pages site.
+              new=new.replace('href="/"', f'href="{base}/"')
+              if new != text:
+                  path.write_text(new, encoding="utf-8")
+                  changed += 1
+
+          # Keep the public URL simple: repository root opens Open Studio.
+          root_index=root/"index.html"
+          if not root_index.exists():
+              root_index.write_text(
+                  '<!doctype html><html><head><meta charset="utf-8">'
+                  '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                  f'<meta http-equiv="refresh" content="0;url={base}/projects/open-studio/">'
+                  f'<link rel="canonical" href="{base}/projects/open-studio/">'
+                  '<title>Open Studio</title></head>'
+                  f'<body><a href="{base}/projects/open-studio/">Open Studio</a></body></html>',
+                  encoding="utf-8",
+              )
+
+          print(f"Rebased {changed} text assets for GitHub Pages base {base}")
+          print("root index:", root_index)
+          PY
+
+          echo "Checking final Open Studio asset references..."
+          grep -nE 'projects/open-studio/assets|studio-.*\.css|studio-.*\.js'             "${OUTPUT_DIR}/projects/open-studio/index.html" | head -n 20
 
       - name: Disable Jekyll
         run: touch "${{ steps.output.outputs.dir }}/.nojekyll"
