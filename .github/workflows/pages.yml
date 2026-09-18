@@ -1,0 +1,129 @@
+name: Deploy Open Studio to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/pages.yml"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: open-studio-pages
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout deployment repo
+        uses: actions/checkout@v4
+
+      - name: Download Open Studio source release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/open-studio
+          gh release download v1.0.0             --repo "${GITHUB_REPOSITORY}"             --pattern "jinji-open-archive-source.zip"             --dir /tmp/open-studio
+          unzip -q /tmp/open-studio/jinji-open-archive-source.zip -d /tmp/open-studio/source
+          echo "Downloaded source:"
+          du -sh /tmp/open-studio/source
+          find /tmp/open-studio/source -maxdepth 4 -name package.json -print
+
+      - name: Locate web app
+        id: app
+        shell: bash
+        run: |
+          PACKAGE_JSON=$(find /tmp/open-studio/source -maxdepth 5 -name package.json -not -path "*/node_modules/*" | head -n 1)
+          if [ -z "$PACKAGE_JSON" ]; then
+            echo "No package.json found in release archive."
+            exit 1
+          fi
+          APP_DIR=$(dirname "$PACKAGE_JSON")
+          echo "dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+          echo "APP_DIR=$APP_DIR"
+          cat "$PACKAGE_JSON"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        working-directory: ${{ steps.app.outputs.dir }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --frozen-lockfile
+          else
+            npm install
+          fi
+
+      - name: Build site
+        working-directory: ${{ steps.app.outputs.dir }}
+        shell: bash
+        run: |
+          if node -e "const p=require('./package.json');process.exit(((p.dependencies&&p.dependencies.vite)||(p.devDependencies&&p.devDependencies.vite))?0:1)"; then
+            npm run build -- --base=./
+          else
+            npm run build
+          fi
+
+      - name: Resolve static output
+        id: output
+        working-directory: ${{ steps.app.outputs.dir }}
+        shell: bash
+        run: |
+          for dir in dist out build .output/public public; do
+            if [ -f "$dir/index.html" ]; then
+              REAL=$(realpath "$dir")
+              echo "dir=$REAL" >> "$GITHUB_OUTPUT"
+              echo "Using static output: $REAL"
+              du -sh "$REAL"
+              exit 0
+            fi
+          done
+
+          INDEX=$(find . -maxdepth 5 -name index.html -not -path "*/node_modules/*" | head -n 1)
+          if [ -n "$INDEX" ]; then
+            REAL=$(realpath "$(dirname "$INDEX")")
+            echo "dir=$REAL" >> "$GITHUB_OUTPUT"
+            echo "Using discovered output: $REAL"
+            exit 0
+          fi
+
+          echo "Build completed but no static index.html output was found."
+          find . -maxdepth 4 -type f | head -n 200
+          exit 1
+
+      - name: Disable Jekyll
+        run: touch "${{ steps.output.outputs.dir }}/.nojekyll"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ steps.output.outputs.dir }}
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
